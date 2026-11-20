@@ -61,6 +61,8 @@ export default function Canvas() {
   viewRef.current = view;
   docRef.current = doc;
   const [linking, setLinking] = useState(null); // { from, x, y } 拖拽中的临时连线
+  const [editingId, setEditingId] = useState(null); // 就地编辑的节点
+  const [aiBusy, setAiBusy] = useState(null); // 正在润色的节点 id（null 表示底部输入框）
 
   // 首次进入默认选中第一个节点（对齐原站的高亮态）
   useEffect(() => {
@@ -78,6 +80,57 @@ export default function Canvas() {
     }, 400);
     return () => clearTimeout(t);
   }, [doc]);
+
+  /* ---------------- 选中节点 ↔ 底部输入框 联动 ---------------- */
+  const singleSelected = selected.length === 1 ? doc.nodes.find((n) => n.id === selected[0]) : null;
+
+  useEffect(() => {
+    if (singleSelected) setPrompt(singleSelected.text || '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [singleSelected?.id]);
+
+  const setNodeText = (id, text) =>
+    setDoc((d) => ({ ...d, nodes: d.nodes.map((n) => (n.id === id ? { ...n, text } : n)) }));
+
+  const onPromptChange = (v) => {
+    setPrompt(v);
+    if (singleSelected) setNodeText(singleSelected.id, v);
+  };
+
+  /* ---------------- AI 提示词润色 ---------------- */
+  const AI_SYS =
+    '你是短视频分镜提示词专家。把用户的草稿改写成一条可直接用于 AI 视频生成的中文提示词：'
+    + '保留原意，补上镜头运动、主体动作、环境与光线、画面质感；一个镜头只写一个主动作；'
+    + '全角标点，严格控制在 140 字以内；只输出提示词本身，不要解释、不要加引号或前缀。';
+
+  const aiRefine = async (nodeId = null) => {
+    const src = nodeId ? (doc.nodes.find((n) => n.id === nodeId)?.text || '') : prompt;
+    const seed = String(src).trim();
+    if (seed.length < 2) return toast('先写点内容再润色', 'error');
+    setAiBusy(nodeId ?? 'prompt');
+    try {
+      const { content } = await api.chat({
+        model: 'muse-spark',
+        messages: [
+          { role: 'system', content: AI_SYS },
+          { role: 'user', content: seed },
+        ],
+      });
+      const t = String(content || '').trim();
+      if (!t) throw new Error('模型没有返回内容');
+      if (nodeId) {
+        setNodeText(nodeId, t);
+      } else {
+        setPrompt(t);
+        if (singleSelected) setNodeText(singleSelected.id, t);
+      }
+      toast('提示词已润色', 'ok');
+    } catch (e) {
+      toast(e.message || '润色失败', 'error');
+    } finally {
+      setAiBusy(null);
+    }
+  };
 
   /* ---------------- 视口变换 ---------------- */
   const screenToCanvas = (clientX, clientY) => {
@@ -499,10 +552,12 @@ export default function Canvas() {
                 active={selected.includes(n.id)}
                 onMouseDown={(e) => onNodeDown(e, n)}
                 onPortDown={(e) => startLink(e, n)}
-                onDoubleClick={() => {
-                  const t = window.prompt('节点文本', n.text || '');
-                  if (t != null) setDoc((d) => ({ ...d, nodes: d.nodes.map((x) => x.id === n.id ? { ...x, text: t } : x) }));
-                }}
+                editing={editingId === n.id}
+                aiBusy={aiBusy === n.id}
+                onStartEdit={() => { setSelected([n.id]); setEditingId(n.id); }}
+                onTextChange={(v) => setNodeText(n.id, v)}
+                onEndEdit={() => setEditingId(null)}
+                onAi={() => aiRefine(n.id)}
               />
             ))}
           </div>
@@ -561,11 +616,20 @@ export default function Canvas() {
             </button>
             <input
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(e) => onPromptChange(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); generate(); } }}
-              placeholder="描述你想要生成的视频内容…"
+              placeholder="描述你想要生成的视频内容…（选中节点后编辑会同步到节点）"
               className="h-11 min-w-0 flex-1 rounded-xl border border-white/[0.06] bg-[#0d111c] px-3.5 text-[13px] text-mist-100 outline-none placeholder:text-mist-400/70 focus:border-brand-400/50"
             />
+            <button
+              onClick={() => aiRefine(singleSelected ? singleSelected.id : null)}
+              disabled={aiBusy === 'prompt' || (singleSelected ? aiBusy === singleSelected.id : false)}
+              title="AI 润色成视频提示词"
+              className="flex h-11 shrink-0 items-center gap-1.5 rounded-xl border border-brand-400/30 px-3 text-[12.5px] text-brand-200 transition hover:bg-brand-400/10 hover:text-white disabled:opacity-40"
+            >
+              {aiBusy ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+              AI 润色
+            </button>
             <select
               value={duration}
               onChange={(e) => setDuration(Number(e.target.value))}
@@ -664,7 +728,7 @@ function Minimap({ nodes, view, vp }) {
   );
 }
 
-function CanvasNode({ node, active, onMouseDown, onPortDown, onDoubleClick }) {
+function CanvasNode({ node, active, onMouseDown, onPortDown, editing, aiBusy, onStartEdit, onTextChange, onEndEdit, onAi }) {
   const running = node.status === 'running';
   const failed = node.status === 'failed';
   const isText = node.type === 'text';
@@ -676,7 +740,6 @@ function CanvasNode({ node, active, onMouseDown, onPortDown, onDoubleClick }) {
   return (
     <div
       onMouseDown={onMouseDown}
-      onDoubleClick={onDoubleClick}
       style={{ left: node.x, top: node.y, width: NODE_W }}
       className={clsx('glass-node absolute cursor-grab p-3.5 active:cursor-grabbing', active && 'is-active')}
     >
@@ -702,35 +765,76 @@ function CanvasNode({ node, active, onMouseDown, onPortDown, onDoubleClick }) {
           <Icon size={15} className="text-brand-400" />
           {title}
         </span>
-        <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-mist-300">{role}</span>
+        <span className="flex items-center gap-1.5">
+          <button
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={onAi}
+            disabled={aiBusy}
+            title="AI 润色提示词"
+            className="grid h-5 w-5 place-items-center rounded-md text-brand-300/80 transition hover:bg-brand-400/15 hover:text-brand-200 disabled:opacity-40"
+          >
+            {aiBusy ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+          </button>
+          <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-mist-300">{role}</span>
+        </span>
       </div>
 
       {isText ? (
-        <p className="line-clamp-4 min-h-[76px] rounded-xl border border-white/[0.06] bg-[#0d111c]/80 px-3 py-2.5 text-[12px] leading-relaxed text-mist-200">
-          {node.text || '空文本，双击编辑'}
-        </p>
+        editing ? (
+          <textarea
+            autoFocus
+            value={node.text || ''}
+            onMouseDown={(e) => e.stopPropagation()}
+            onChange={(e) => onTextChange(e.target.value)}
+            onBlur={onEndEdit}
+            onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); onEndEdit(); } }}
+            className="h-[92px] w-full resize-none rounded-xl border border-brand-400/40 bg-[#0d111c] px-3 py-2.5 text-[12px] leading-relaxed text-mist-100 outline-none"
+          />
+        ) : (
+          <p
+            onDoubleClick={onStartEdit}
+            title="双击就地编辑"
+            className="min-h-[76px] cursor-text whitespace-pre-wrap rounded-xl border border-white/[0.06] bg-[#0d111c]/80 px-3 py-2.5 text-[12px] leading-relaxed text-mist-200 hover:border-brand-400/30"
+          >
+            {node.text || '双击编辑…'}
+          </p>
+        )
       ) : (
-        <div className="relative overflow-hidden rounded-xl bg-black/40">
-          {node.mediaUrl ? (
-            node.type === 'video' ? (
-              <video src={node.mediaUrl} muted loop playsInline autoPlay className="h-[128px] w-full object-cover" />
-            ) : (
-              <img src={node.mediaUrl} alt="" className="h-[128px] w-full object-cover" />
-            )
-          ) : (
-            <div className="grid h-[128px] place-items-center bg-[radial-gradient(circle_at_30%_20%,rgba(15,169,138,.14),transparent_60%)]">
-              {running ? (
-                <div className="flex items-center gap-1.5 text-[12px] text-brand-300">
-                  <Loader2 size={14} className="animate-spin" /> {node.progress || 0}%
-                </div>
-              ) : failed ? (
-                <span className="text-[11.5px] text-rose-400">生成失败</span>
+        <>
+          <div className="relative overflow-hidden rounded-xl bg-black/40">
+            {node.mediaUrl ? (
+              node.type === 'video' ? (
+                <video src={node.mediaUrl} muted loop playsInline autoPlay className="h-[128px] w-full object-cover" />
               ) : (
-                <span className="text-[11.5px] text-mist-400">待生成</span>
-              )}
-            </div>
+                <img src={node.mediaUrl} alt="" className="h-[128px] w-full object-cover" />
+              )
+            ) : (
+              <div className="grid h-[128px] place-items-center bg-[radial-gradient(circle_at_30%_20%,rgba(15,169,138,.14),transparent_60%)]">
+                {running ? (
+                  <div className="flex items-center gap-1.5 text-[12px] text-brand-300">
+                    <Loader2 size={14} className="animate-spin" /> {node.progress || 0}%
+                  </div>
+                ) : failed ? (
+                  <span className="text-[11.5px] text-rose-400">生成失败</span>
+                ) : (
+                  <span className="text-[11.5px] text-mist-400">待生成</span>
+                )}
+              </div>
+            )}
+          </div>
+          {editing && (
+            <textarea
+              autoFocus
+              value={node.text || ''}
+              onMouseDown={(e) => e.stopPropagation()}
+              onChange={(e) => onTextChange(e.target.value)}
+              onBlur={onEndEdit}
+              onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); onEndEdit(); } }}
+              placeholder="这个镜头的提示词…"
+              className="mt-2 h-[68px] w-full resize-none rounded-xl border border-brand-400/40 bg-[#0d111c] px-2.5 py-2 text-[11.5px] leading-relaxed text-mist-100 outline-none"
+            />
           )}
-        </div>
+        </>
       )}
 
       <div className="mt-2.5 flex items-center justify-between gap-2 text-[11px]">
@@ -740,7 +844,11 @@ function CanvasNode({ node, active, onMouseDown, onPortDown, onDoubleClick }) {
           </span>
         ) : (
           <>
-            <span className="truncate text-mist-200" title={node.text}>{fileName || node.text || node.label}</span>
+            <span
+              onDoubleClick={onStartEdit}
+              title={node.text || '双击编辑提示词'}
+              className="cursor-text truncate text-mist-200 hover:text-white"
+            >{fileName || node.text || node.label}</span>
             <span className={clsx('flex shrink-0 items-center gap-1', failed ? 'text-rose-300' : running ? 'text-mist-300' : node.mediaUrl ? 'text-brand-300' : 'text-mist-400')}>
               <span className={clsx('h-1.5 w-1.5 rounded-full', failed ? 'bg-rose-400' : running ? 'bg-amber-400' : node.mediaUrl ? 'bg-brand-400' : 'bg-mist-400')} />
               {failed ? '失败' : running ? '生成中' : node.mediaUrl ? '生成完成' : '空'}
