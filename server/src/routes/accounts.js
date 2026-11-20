@@ -273,7 +273,11 @@ r.delete('/:id', requireAuth, async (req, res) => {
   if (row.upstream_id) {
     try { await muse.deleteAccount(row.upstream_id); } catch (e) { /* 上游已不存在也照删 */ }
   }
-  deleteAccountRow(row.id);
+  try {
+    deleteAccountRow(row.id);
+  } catch (e) {
+    return res.status(500).json({ error: '删除账号失败：' + e.message });
+  }
   res.json({ ok: true });
 });
 

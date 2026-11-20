@@ -107,6 +107,13 @@ function bootstrap() {
 bootstrap();
 startWorker();
 
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandledRejection]', (e && e.stack) || e);
+});
+process.on('uncaughtException', (e) => {
+  console.error('[uncaughtException]', (e && e.stack) || e);
+});
+
 app.listen(CFG.port, CFG.host, () => {
   console.log(`[server] 平台后端已启动 http://${CFG.host}:${CFG.port}`);
   console.log(`[server] 上游 muse2api ${CFG.museBase}`);
