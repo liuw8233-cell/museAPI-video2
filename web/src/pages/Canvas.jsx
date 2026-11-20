@@ -54,8 +54,13 @@ export default function Canvas() {
   const [vpSize, setVpSize] = useState({ w: 800, h: 500 });
 
   const viewportRef = useRef(null);
-  const dragRef = useRef(null); // { mode:'pan'|'node', ... }
+  const dragRef = useRef(null); // { mode:'pan'|'node'|'link', ... }
   const bootRef = useRef(false);
+  const viewRef = useRef(view);
+  const docRef = useRef(doc);
+  viewRef.current = view;
+  docRef.current = doc;
+  const [linking, setLinking] = useState(null); // { from, x, y } 拖拽中的临时连线
 
   // 首次进入默认选中第一个节点（对齐原站的高亮态）
   useEffect(() => {
@@ -151,6 +156,51 @@ export default function Canvas() {
     }
   };
 
+  /* ---------------- 手动连线 ---------------- */
+  const startLink = (e, node) => {
+    if (e.button === 2) return;
+    e.stopPropagation();
+    const v = viewRef.current;
+    const rect = viewportRef.current?.getBoundingClientRect();
+    const origin = {
+      x: node.x + NODE_W,
+      y: node.y + nodeH(node) / 2,
+    };
+    dragRef.current = { mode: 'link', from: node.id };
+    setLinking({ from: node.id, x: origin.x, y: origin.y });
+    // 记录鼠标原位，避免首帧跳动
+    if (rect) {
+      setLinking({
+        from: node.id,
+        x: (e.clientX - rect.left - v.x) / v.z,
+        y: (e.clientY - rect.top - v.y) / v.z,
+      });
+    }
+  };
+
+  const hitNode = (pt, excludeId) => {
+    const nodes = docRef.current.nodes;
+    for (let i = nodes.length - 1; i >= 0; i -= 1) {
+      const n = nodes[i];
+      if (n.id === excludeId) continue;
+      if (pt.x >= n.x && pt.x <= n.x + NODE_W && pt.y >= n.y && pt.y <= n.y + nodeH(n)) return n;
+    }
+    return null;
+  };
+
+  const addLink = (from, to) => {
+    if (!from || !to || from === to) return;
+    setDoc((d) => {
+      const exists = (d.links || []).some((l) => l.from === from && l.to === to);
+      if (exists) return d;
+      return { ...d, links: [...(d.links || []), { from, to }] };
+    });
+  };
+
+  const removeLink = (from, to) => {
+    setDoc((d) => ({ ...d, links: (d.links || []).filter((l) => !(l.from === from && l.to === to)) }));
+  };
+
   useEffect(() => {
     const onMove = (e) => {
       const d = dragRef.current;
@@ -173,9 +223,35 @@ export default function Canvas() {
             return n;
           }),
         }));
+      } else if (d.mode === 'link') {
+        const v = viewRef.current;
+        const rect = viewportRef.current?.getBoundingClientRect();
+        if (rect) {
+          setLinking({
+            from: d.from,
+            x: (e.clientX - rect.left - v.x) / v.z,
+            y: (e.clientY - rect.top - v.y) / v.z,
+          });
+        }
       }
     };
-    const onUp = () => { dragRef.current = null; };
+    const onUp = (e) => {
+      const d = dragRef.current;
+      if (d?.mode === 'link') {
+        const v = viewRef.current;
+        const rect = viewportRef.current?.getBoundingClientRect();
+        if (rect) {
+          const pt = {
+            x: (e.clientX - rect.left - v.x) / v.z,
+            y: (e.clientY - rect.top - v.y) / v.z,
+          };
+          const target = hitNode(pt, d.from);
+          if (target) addLink(d.from, target.id);
+        }
+        setLinking(null);
+      }
+      dragRef.current = null;
+    };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => {
@@ -197,7 +273,11 @@ export default function Canvas() {
       }
       if (e.key === 'v' || e.key === 'V') setTool('select');
       if (e.key === 'h' || e.key === 'H') setTool('hand');
-      if (e.key === 'Escape') setSelected([]);
+      if (e.key === 'Escape') {
+        dragRef.current = null;
+        setLinking(null);
+        setSelected([]);
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -376,17 +456,40 @@ export default function Canvas() {
                 const x2 = b.x;
                 const y2 = b.y + nodeH(b) / 2;
                 const mx = (x1 + x2) / 2;
+                const d = `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
                 return (
-                  <path
-                    key={l.from + l.to}
-                    d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`}
-                    fill="none"
-                    stroke="rgba(184,192,208,.45)"
-                    strokeWidth="1.5"
-                    strokeDasharray="5 5"
-                  />
+                  <g key={l.from + l.to}>
+                    <path d={d} fill="none" stroke="rgba(184,192,208,.45)" strokeWidth="1.5" strokeDasharray="5 5" />
+                    {/* 加粗的透明命中区：悬停高亮，双击删除 */}
+                    <path
+                      d={d}
+                      fill="none"
+                      stroke="rgba(0,0,0,0)"
+                      strokeWidth="14"
+                      style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+                      onMouseEnter={(e) => { e.currentTarget.setAttribute('stroke', 'rgba(239,68,68,.28)'); }}
+                      onMouseLeave={(e) => { e.currentTarget.setAttribute('stroke', 'rgba(0,0,0,0)'); }}
+                      onDoubleClick={() => removeLink(l.from, l.to)}
+                    />
+                  </g>
                 );
               })}
+              {linking && (() => {
+                const src = nodeById[linking.from];
+                if (!src) return null;
+                const x1 = src.x + NODE_W;
+                const y1 = src.y + nodeH(src) / 2;
+                const mx = (x1 + linking.x) / 2;
+                return (
+                  <path
+                    d={`M${x1},${y1} C${mx},${y1} ${mx},${linking.y} ${linking.x},${linking.y}`}
+                    fill="none"
+                    stroke="rgba(79,227,193,.9)"
+                    strokeWidth="2"
+                    strokeDasharray="6 4"
+                  />
+                );
+              })()}
             </svg>
 
             {doc.nodes.map((n) => (
@@ -395,6 +498,7 @@ export default function Canvas() {
                 node={n}
                 active={selected.includes(n.id)}
                 onMouseDown={(e) => onNodeDown(e, n)}
+                onPortDown={(e) => startLink(e, n)}
                 onDoubleClick={() => {
                   const t = window.prompt('节点文本', n.text || '');
                   if (t != null) setDoc((d) => ({ ...d, nodes: d.nodes.map((x) => x.id === n.id ? { ...x, text: t } : x) }));
@@ -560,7 +664,7 @@ function Minimap({ nodes, view, vp }) {
   );
 }
 
-function CanvasNode({ node, active, onMouseDown, onDoubleClick }) {
+function CanvasNode({ node, active, onMouseDown, onPortDown, onDoubleClick }) {
   const running = node.status === 'running';
   const failed = node.status === 'failed';
   const isText = node.type === 'text';
@@ -576,17 +680,22 @@ function CanvasNode({ node, active, onMouseDown, onDoubleClick }) {
       style={{ left: node.x, top: node.y, width: NODE_W }}
       className={clsx('glass-node absolute cursor-grab p-3.5 active:cursor-grabbing', active && 'is-active')}
     >
-      {/* 连接点 */}
-      {['-left-[7px]', '-right-[7px]'].map((pos) => (
-        <span
-          key={pos}
-          className={clsx(
-            'absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full border-2 bg-[#0d111c]',
-            active ? 'border-brand-400' : 'border-mist-400/60',
-            pos
-          )}
-        />
-      ))}
+      {/* 连接点：左=输入，右=输出（拖出可连线） */}
+      <span
+        className={clsx(
+          'absolute -left-[7px] top-1/2 h-3 w-3 -translate-y-1/2 rounded-full border-2 bg-[#0d111c]',
+          active ? 'border-brand-400' : 'border-mist-400/60'
+        )}
+      />
+      <span
+        onMouseDown={onPortDown}
+        title="拖拽到目标节点即可连线"
+        className={clsx(
+          'absolute -right-[7px] top-1/2 h-3 w-3 -translate-y-1/2 cursor-crosshair rounded-full border-2 bg-[#0d111c] transition',
+          'hover:scale-150 hover:border-brand-300 hover:bg-brand-400/40',
+          active ? 'border-brand-400' : 'border-mist-400/60'
+        )}
+      />
 
       <div className="mb-2.5 flex items-center justify-between">
         <span className="flex items-center gap-2 text-[13px] font-semibold text-white">
