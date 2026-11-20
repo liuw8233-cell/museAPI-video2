@@ -15,6 +15,23 @@
 | `generate_image` | 提交图片任务，返回 job |
 | `job_status` | 查单个任务进度与结果 |
 | `list_jobs` | 最近任务列表 |
+| `canvas_list` | 列出服务端画布 |
+| `canvas_create` | 新建画布 |
+| `canvas_get` | 读取画布完整内容 |
+| `canvas_ops` | 批量操作画布（建节点/改文字/移动/连线/删除） |
+| `canvas_replace` | 整体覆盖画布（慎用） |
+
+### 画布操作语义
+
+`canvas_ops` 的 `ops` 与前端 AI 助手完全一致：
+
+```json
+{"op":"add_text","x":420,"y":240,"text":"镜头1","as":"s1"}
+{"op":"add_text","x":740,"y":240,"text":"镜头2","as":"s2"}
+{"op":"link","from":"s1","to":"s2"}
+```
+
+`as` 是本批次别名，`link` 可用别名引用，因此一轮就能"建 N 个节点并串起来"。
 
 ## 环境变量
 

@@ -17,6 +17,7 @@ import queueRoutes from './routes/queue.js';
 import teamRoutes from './routes/team.js';
 import chatRoutes from './routes/chat.js';
 import chromeRoutes from './routes/chrome.js';
+import canvasRoutes from './routes/canvases.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -62,6 +63,7 @@ app.use('/api', queueRoutes);
 app.use('/api', teamRoutes);
 app.use('/api', chatRoutes);
 app.use('/api', chromeRoutes);
+app.use('/api', canvasRoutes);
 app.use('/api', genRoutes);
 
 // OpenAI 兼容对外接口（用 sk- 密钥鉴权，转发到上游）

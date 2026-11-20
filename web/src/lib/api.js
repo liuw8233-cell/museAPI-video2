@@ -56,7 +56,13 @@ export const api = {
 
   createVideo: (b) => request('/api/videos', { method: 'POST', body: b }),
   createImage: (b) => request('/api/images', { method: 'POST', body: b }),
-  chat: (b) => request('/api/chat', { method: 'POST', body: b }),
+
+  canvases: () => request('/api/canvases'),
+  createCanvas: (b) => request('/api/canvases', { method: 'POST', body: b }),
+  canvas: (id) => request(`/api/canvases/${id}`),
+  saveCanvas: (id, b) => request(`/api/canvases/${id}`, { method: 'PUT', body: b }),
+  canvasOps: (id, ops) => request(`/api/canvases/${id}/ops`, { method: 'POST', body: { ops } }),
+
   jobs: (q = {}) => {
     const s = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined && v !== null && v !== ''));
     return request(`/api/jobs?${s.toString()}`);

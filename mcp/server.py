@@ -131,6 +131,61 @@ TOOLS = [
         "description": "列出最近的任务。",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "canvas_list",
+        "description": "列出平台上的画布（服务端存储），返回 id / 名称 / 节点数。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "canvas_create",
+        "description": "新建一个画布，返回画布 id。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "画布名称"}},
+        },
+    },
+    {
+        "name": "canvas_get",
+        "description": "读取指定画布的完整内容（节点与连线）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "画布 id"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "canvas_ops",
+        "description": (
+            "对画布执行一批操作。可选 op："
+            "add_text(x,y,text,as) / add_image(x,y,as) / add_video(x,y,text,as) / "
+            "set_text(id,text) / move(id,x,y) / link(from,to) / delete(id) / "
+            "generate_video 占位节点。add 的 as 是别名，同批次 link 可用别名引用。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "画布 id"},
+                "ops": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "操作数组，例如 [{\"op\":\"add_text\",\"x\":420,\"y\":240,\"text\":\"镜头1\",\"as\":\"s1\"}]",
+                },
+            },
+            "required": ["id", "ops"],
+        },
+    },
+    {
+        "name": "canvas_replace",
+        "description": "整体覆盖画布内容（doc = {nodes:[], links:[]}）。慎用。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "画布 id"},
+                "doc": {"type": "object", "description": "完整画布文档"},
+            },
+            "required": ["id", "doc"],
+        },
+    },
 ]
 
 
@@ -157,6 +212,18 @@ def dispatch(name, args):
         return with_auth("/api/jobs/%s" % urllib.parse.quote(args.get("id", "")))
     if name == "list_jobs":
         return with_auth("/api/jobs")
+    if name == "canvas_list":
+        return with_auth("/api/canvases")
+    if name == "canvas_create":
+        return with_auth("/api/canvases", "POST", {"name": args.get("name") or "主画布"})
+    if name == "canvas_get":
+        return with_auth("/api/canvases/%s" % urllib.parse.quote(args.get("id", "")))
+    if name == "canvas_ops":
+        cid = urllib.parse.quote(args.get("id", ""))
+        return with_auth("/api/canvases/%s/ops" % cid, "POST", {"ops": args.get("ops") or []})
+    if name == "canvas_replace":
+        cid = urllib.parse.quote(args.get("id", ""))
+        return with_auth("/api/canvases/%s" % cid, "PUT", {"doc": args.get("doc") or {}})
     raise HttpError("未知工具：%s" % name)
 
 

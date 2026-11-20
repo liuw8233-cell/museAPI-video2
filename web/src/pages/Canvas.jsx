@@ -98,15 +98,54 @@ export default function Canvas() {
     if (doc.nodes.length) setSelected([doc.nodes[0].id]);
   }, [doc.nodes]);
 
-  /* ---------------- 持久化 ---------------- */
+  /* ---------------- 持久化：服务端为主，localStorage 作离线缓存 ---------------- */
+  const [canvasId, setCanvasId] = useState(null);
+  const [ready, setReady] = useState(false);
+  const canvasIdRef = useRef(null);
+  canvasIdRef.current = canvasId;
+
   useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const { canvases } = await api.canvases();
+        let current = canvases && canvases[0];
+        if (!current) {
+          const created = await api.createCanvas({ name: '主画布', doc });
+          current = created.canvas;
+        } else if (current.nodes === 0 && doc.nodes.length) {
+          // 服务端是空的、本地还有内容 → 把本地内容推上去
+          await api.saveCanvas(current.id, { doc });
+        }
+        if (!alive) return;
+        setCanvasId(current.id);
+        if (current.doc && Array.isArray(current.doc.nodes) && current.doc.nodes.length) {
+          setDoc(current.doc);
+        }
+      } catch {
+        // 接口不可用时退回纯本地模式，不影响使用
+      } finally {
+        if (alive) setReady(true);
+      }
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return undefined;
     setSaved(false);
-    const t = setTimeout(() => {
-      localStorage.setItem(STORE_KEY, JSON.stringify(doc));
-      setSaved(true);
-    }, 400);
+    const t = setTimeout(async () => {
+      try {
+        localStorage.setItem(STORE_KEY, JSON.stringify(doc));
+        if (canvasIdRef.current) await api.saveCanvas(canvasIdRef.current, { doc });
+        setSaved(true);
+      } catch {
+        setSaved(true);
+      }
+    }, 500);
     return () => clearTimeout(t);
-  }, [doc]);
+  }, [doc, ready]);
 
   /* ---------------- 选中节点 ↔ 底部输入框 联动 ---------------- */
   const singleSelected = selected.length === 1 ? doc.nodes.find((n) => n.id === selected[0]) : null;
@@ -297,7 +336,18 @@ export default function Canvas() {
         ],
       });
       const { text, ops } = parseOps(String(content || ''));
-      const applied = ops.length ? await applyOps(ops) : 0;
+      let applied = 0;
+      if (ops.length) {
+        if (canvasIdRef.current) {
+          // 走服务端执行：语义与 MCP 完全一致
+          const r = await api.canvasOps(canvasIdRef.current, ops);
+          if (r?.canvas?.doc) setDoc(r.canvas.doc);
+          applied = r?.applied ?? ops.length;
+          if (r?.errors?.length) r.errors.forEach((x) => toast(x, 'error'));
+        } else {
+          applied = await applyOps(ops);
+        }
+      }
       setMsgs([...history, {
         role: 'assistant',
         content: text || (applied ? '好的，已按要求更新画布。' : '（没有内容）'),

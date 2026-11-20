@@ -172,6 +172,16 @@ CREATE TABLE IF NOT EXISTS queue_items (
 );
 CREATE INDEX IF NOT EXISTS idx_queue_user ON queue_items(user_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_queue_due ON queue_items(status, next_run_at);
+
+CREATE TABLE IF NOT EXISTS canvases (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  name       TEXT NOT NULL DEFAULT '主画布',
+  doc        TEXT NOT NULL DEFAULT '{"nodes":[],"links":[]}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_user ON canvases(user_id, updated_at DESC);
 `);
 
 // 邀请关系（老库自动补列）
