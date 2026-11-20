@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Type, Image as ImageIcon, Video, Trash2, ZoomIn, ZoomOut, Maximize, Loader2, X, Sparkles,
   MousePointer2, Hand, ImagePlus, ChevronDown, Map as MapIcon, Expand,
+  MessageSquare, Send, Bot,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { api } from '../lib/api.js';
@@ -13,6 +14,25 @@ const STORE_KEY = 'xm_canvas_v1';
 const NODE_W = 260;
 const NODE_H = 170;
 const nodeH = (n) => (n.type === 'text' ? 150 : 210);
+
+const AGENT_SYS = `你是「无限画布」的画布助手，用中文简洁回答。
+画布节点结构：{id, type, x, y, text}，type 为 text / image / video。
+当用户要求改动画布时，输出且只输出一个 json 代码块，格式 {"ops":[...]}，可用操作：
+{"op":"add_text","x":0,"y":0,"text":"内容","as":"s1"}       新建文本节点，as 是本次批次的别名（可省略）
+{"op":"add_image","x":0,"y":0,"as":"s2"}                    新建图片节点
+{"op":"add_video","x":0,"y":0,"text":"提示词","as":"s3"}    新建视频节点（仅占位，不提交生成）
+{"op":"set_text","id":"真实id","text":"新内容"}             改写节点文字
+{"op":"move","id":"真实id","x":0,"y":0}                     移动节点
+{"op":"link","from":"s1","to":"s2"}                         连线，from/to 可填别名或真实 id
+{"op":"delete","id":"真实id"}                               删除节点
+{"op":"generate_video","text":"提示词","duration":5,"size":"16:9","x":0,"y":0,"as":"v1"} 提交视频生成
+规则：
+1 只使用用户消息里给出的真实 id 或本批次自己起的别名，不要编造。
+2 新建节点坐标自己算，横向间隔 320、纵向间隔 260，避免重叠。
+3 必须用 json 代码围栏包裹整个对象（三个反引号开头写 json），代码块外不要重复 JSON。
+4 用户说"连起来/串起来/接上"时，必须输出对应数量的 link 操作，按顺序首尾相连，用别名引用。
+5 用户只是问提示词怎么写，就不要输出 ops，直接把提示词给他。
+6 普通回答不要输出 json。`;
 
 let seq = 1;
 const newId = () => `n_${Date.now().toString(36)}_${seq++}`;
@@ -63,6 +83,13 @@ export default function Canvas() {
   const [linking, setLinking] = useState(null); // { from, x, y } 拖拽中的临时连线
   const [editingId, setEditingId] = useState(null); // 就地编辑的节点
   const [aiBusy, setAiBusy] = useState(null); // 正在润色的节点 id（null 表示底部输入框）
+
+  /* 侧边 AI 助手 */
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [msgs, setMsgs] = useState([]);
+  const [agentInput, setAgentInput] = useState('');
+  const [agentBusy, setAgentBusy] = useState(false);
+  const msgEndRef = useRef(null);
 
   // 首次进入默认选中第一个节点（对齐原站的高亮态）
   useEffect(() => {
@@ -131,6 +158,162 @@ export default function Canvas() {
       setAiBusy(null);
     }
   };
+
+  /* ---------------- 侧边助手：把画布状态喂给模型 ---------------- */
+  const canvasContext = () => {
+    const ns = docRef.current.nodes.slice(0, 40).map((n) => ({
+      id: n.id,
+      type: n.type,
+      x: Math.round(n.x),
+      y: Math.round(n.y),
+      text: (n.text || '').slice(0, 60),
+    }));
+    return `当前画布节点：${JSON.stringify(ns)}`;
+  };
+
+  const parseOps = (content) => {
+    let text = String(content || '').trim();
+    let ops = [];
+
+    // 1) 优先解析 ```json 代码块
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) {
+      try {
+        const o = JSON.parse(fenced[1].trim());
+        ops = Array.isArray(o) ? o : (o.ops || []);
+        text = text.replace(fenced[0], '').trim();
+      } catch { ops = []; }
+    }
+
+    // 2) 兼容不带围栏的裸 JSON（模型经常这样输出）
+    if (!ops.length) {
+      const s = text.indexOf('{');
+      const e = text.lastIndexOf('}');
+      if (s >= 0 && e > s) {
+        try {
+          const o = JSON.parse(text.slice(s, e + 1));
+          const arr = Array.isArray(o) ? o : (o.ops || []);
+          if (Array.isArray(arr) && arr.length && arr.every((x) => x && typeof x.op === 'string')) {
+            ops = arr;
+            text = `${text.slice(0, s)}${text.slice(e + 1)}`.trim();
+          }
+        } catch { /* 不是 JSON，当普通文本 */ }
+      }
+    }
+
+    if (/^json$/i.test(text)) text = '';
+    return { text, ops: Array.isArray(ops) ? ops : [] };
+  };
+
+  const autoXY = (i = 0) => {
+    const nodes = docRef.current.nodes;
+    if (!nodes.length) return { x: 420, y: 240 };
+    const maxX = Math.max(...nodes.map((n) => n.x + NODE_W));
+    const minY = Math.min(...nodes.map((n) => n.y));
+    return { x: maxX + 80, y: minY + i * 260 };
+  };
+
+  const applyOps = async (ops) => {
+    let done = 0;
+    const alias = {}; // 本批次别名 -> 真实节点 id
+    const resolve = (ref) => alias[ref] || ref;
+    for (let i = 0; i < ops.length; i += 1) {
+      const op = ops[i] || {};
+      try {
+        if (op.op === 'add_text' || op.op === 'add_image' || op.op === 'add_video') {
+          const type = op.op === 'add_text' ? 'text' : op.op === 'add_image' ? 'image' : 'video';
+          const pos = (op.x == null || op.y == null) ? autoXY(i) : { x: Number(op.x), y: Number(op.y) };
+          const n = {
+            id: newId(),
+            type,
+            x: pos.x,
+            y: pos.y,
+            text: op.text || '',
+            label: type === 'text' ? '文本' : type === 'image' ? '图片' : '视频',
+          };
+          if (op.as) alias[op.as] = n.id;
+          setDoc((d) => ({ ...d, nodes: [...d.nodes, n] }));
+          done += 1;
+        } else if (op.op === 'set_text' && op.id) {
+          setDoc((d) => ({ ...d, nodes: d.nodes.map((n) => (n.id === resolve(op.id) ? { ...n, text: String(op.text ?? '') } : n)) }));
+          done += 1;
+        } else if (op.op === 'move' && op.id) {
+          setDoc((d) => ({
+            ...d,
+            nodes: d.nodes.map((n) => (n.id === resolve(op.id) ? { ...n, x: Number(op.x) || n.x, y: Number(op.y) || n.y } : n)),
+          }));
+          done += 1;
+        } else if (op.op === 'link' && op.from && op.to) {
+          addLink(resolve(op.from), resolve(op.to));
+          done += 1;
+        } else if (op.op === 'delete' && op.id) {
+          setDoc((d) => pruneLinks({ ...d, nodes: d.nodes.filter((n) => n.id !== resolve(op.id)) }));
+          done += 1;
+        } else if (op.op === 'generate_video' && op.text) {
+          // eslint-disable-next-line no-await-in-loop
+          const job = await api.createVideo({
+            prompt: String(op.text),
+            duration: Number(op.duration) || 5,
+            size: op.size || '16:9',
+            images: [],
+          });
+          const pos = (op.x == null || op.y == null) ? autoXY(i) : { x: Number(op.x), y: Number(op.y) };
+          const n = {
+            id: newId(),
+            type: 'video',
+            x: pos.x,
+            y: pos.y,
+            text: String(op.text),
+            label: '视频',
+            jobId: job.id,
+            status: 'running',
+            mediaUrl: null,
+          };
+          if (op.as) alias[op.as] = n.id;
+          setDoc((d) => ({ ...d, nodes: [...d.nodes, n] }));
+          done += 1;
+        }
+      } catch (e) {
+        toast(`操作 ${op.op} 失败：${e.message}`, 'error');
+      }
+    }
+    return done;
+  };
+
+  const sendAgent = async () => {
+    const q = agentInput.trim();
+    if (!q || agentBusy) return;
+    const history = [...msgs, { role: 'user', content: q }];
+    setMsgs(history);
+    setAgentInput('');
+    setAgentBusy(true);
+    try {
+      const { content } = await api.chat({
+        model: 'muse-spark',
+        messages: [
+          { role: 'system', content: AGENT_SYS },
+          { role: 'system', content: canvasContext() },
+          ...history.slice(-12).map((m) => ({ role: m.role, content: m.content })),
+        ],
+      });
+      const { text, ops } = parseOps(String(content || ''));
+      const applied = ops.length ? await applyOps(ops) : 0;
+      setMsgs([...history, {
+        role: 'assistant',
+        content: text || (applied ? '好的，已按要求更新画布。' : '（没有内容）'),
+        note: applied ? `已执行 ${applied} 个画布操作` : null,
+      }]);
+      if (applied) refresh();
+    } catch (e) {
+      setMsgs([...history, { role: 'assistant', content: `出错了：${e.message}` }]);
+    } finally {
+      setAgentBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (agentOpen) msgEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [msgs, agentOpen, agentBusy]);
 
   /* ---------------- 视口变换 ---------------- */
   const screenToCanvas = (clientX, clientY) => {
@@ -474,10 +657,23 @@ export default function Canvas() {
           </h1>
           <p className="mt-1 text-[12.5px] text-mist-400">在无限画布中自由组织创意与生成视频</p>
         </div>
-        <span className="flex items-center gap-1.5 text-[11.5px] text-mist-400">
-          <span className={clsx('h-1.5 w-1.5 rounded-full', saved ? 'bg-brand-400' : 'bg-mist-400')} />
-          {saved ? '已自动保存' : '保存中…'}
-        </span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setAgentOpen((v) => !v)}
+            className={clsx(
+              'flex h-9 items-center gap-1.5 rounded-xl border px-3 text-[12.5px] transition',
+              agentOpen
+                ? 'border-brand-400/40 bg-brand-400/10 text-brand-200'
+                : 'border-white/[0.08] text-mist-200 hover:border-brand-400/30 hover:text-white'
+            )}
+          >
+            <MessageSquare size={14} /> AI 助手
+          </button>
+          <span className="flex items-center gap-1.5 text-[11.5px] text-mist-400">
+            <span className={clsx('h-1.5 w-1.5 rounded-full', saved ? 'bg-brand-400' : 'bg-mist-400')} />
+            {saved ? '已自动保存' : '保存中…'}
+          </span>
+        </div>
       </div>
 
       {/* ---------------- 画布 ---------------- */}
@@ -656,6 +852,68 @@ export default function Canvas() {
             </button>
           </div>
         </div>
+
+        {/* ---------------- 侧边 AI 助手 ---------------- */}
+        {agentOpen && (
+          <div className="absolute right-0 top-0 z-30 flex h-full w-[340px] flex-col border-l border-white/[0.08] bg-[#0b0f18]/95 backdrop-blur-xl">
+            <div className="flex shrink-0 items-center justify-between border-b border-white/[0.06] px-3.5 py-2.5">
+              <span className="flex items-center gap-2 text-[12.5px] font-semibold text-white">
+                <Bot size={14} className="text-brand-300" /> AI 助手
+              </span>
+              <button onClick={() => setAgentOpen(false)} className="text-mist-400 transition hover:text-white">
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto px-3 py-3">
+              {!msgs.length && (
+                <div className="space-y-1 text-[11.5px] leading-relaxed text-mist-400">
+                  <p className="text-mist-300">可以让我：</p>
+                  <p>· 改写某条提示词</p>
+                  <p>· 一次建多个镜头节点并连起来</p>
+                  <p>· 直接把节点提交生成</p>
+                  <p className="pt-1 text-[10.5px] text-mist-400/70">会读取当前画布的节点 id 和坐标。</p>
+                </div>
+              )}
+              {msgs.map((m, i) => (
+                <div
+                  key={i}
+                  className={clsx(
+                    'whitespace-pre-wrap rounded-xl px-3 py-2 text-[12px] leading-relaxed',
+                    m.role === 'user' ? 'bg-brand-400/10 text-mist-100' : 'bg-white/[0.04] text-mist-200'
+                  )}
+                >
+                  {m.content}
+                  {m.note && <div className="mt-1.5 text-[10.5px] text-brand-300">✓ {m.note}</div>}
+                </div>
+              ))}
+              {agentBusy && (
+                <div className="flex items-center gap-1.5 text-[11.5px] text-mist-400">
+                  <Loader2 size={12} className="animate-spin" /> 思考中…
+                </div>
+              )}
+              <div ref={msgEndRef} />
+            </div>
+
+            <div className="shrink-0 border-t border-white/[0.06] p-2.5">
+              <textarea
+                value={agentInput}
+                onChange={(e) => setAgentInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAgent(); } }}
+                rows={2}
+                placeholder="告诉我要做什么…（Shift+Enter 换行）"
+                className="w-full resize-none rounded-xl border border-white/[0.08] bg-[#0d111c] px-3 py-2 text-[12px] text-mist-100 outline-none placeholder:text-mist-400/60 focus:border-brand-400/40"
+              />
+              <button
+                onClick={sendAgent}
+                disabled={agentBusy || !agentInput.trim()}
+                className="mint-btn mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded-xl text-[12.5px] font-semibold disabled:opacity-40"
+              >
+                <Send size={13} /> 发送
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
